@@ -5,7 +5,6 @@ import AppKit
 import SwiftUI
 import Combine
 import IOKit
-import ServiceManagement
 
 // 系统首选语言是中文就用中文，其余一律英文
 let isChinese = Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
@@ -34,40 +33,11 @@ final class LidModel: ObservableObject {
 
     // 记住“合上继续跑”是本 app 打开的。正常退出会恢复并清掉；强制退出、崩溃、
     // 无免密规则时注销关机会留下它，下次启动据此提醒（见 AppDelegate.checkLeftOn）。
-    // 标记按用户存（disablesleep 却是全机的），只提醒打开它的那个用户；别的用户登录不会被提醒。
-    // 标记在的期间把 app 注册为登录项，这样注销、重启后登录就会自检；标记清掉就撤销登录项
+    // 标记按用户存（disablesleep 却是全机的），只提醒打开它的那个用户；别的用户登录不会被提醒
     static let leftOnKey = "SleepwalkTurnedOn"
     static var leftOn: Bool {
         get { UserDefaults.standard.bool(forKey: leftOnKey) }
-        set {
-            guard newValue != leftOn else { return }
-            UserDefaults.standard.set(newValue, forKey: leftOnKey)
-            syncLoginItem(newValue)
-        }
-    }
-
-    // 只撤销本 app 自己加的登录项；用户原本就设了开机启动的，不动。失败只记日志
-    static let addedLoginItemKey = "SleepwalkAddedLoginItem"
-    static func syncLoginItem(_ want: Bool) {
-        let service = SMAppService.mainApp
-        let defaults = UserDefaults.standard
-        do {
-            if want {
-                // 已注册（包括用户自己关掉、待批准的）就不碰，尊重用户的选择
-                guard service.status == .notRegistered else { return }
-                // 有免密规则时注销关机能自己恢复，不需要登录项（强制退出/崩溃靠下次手动打开时提醒）
-                guard !FileManager.default.fileExists(atPath: ruleFile) else { return }
-                try service.register()
-                defaults.set(true, forKey: addedLoginItemKey)
-            } else if defaults.bool(forKey: addedLoginItemKey) {
-                // 待批准的也要撤，免得以后被批准变成每次登录都启动；撤成功才忘掉“是我加的”，失败下次启动再试
-                // 找不到（app 被移动、改名）时 unregister 会一直失败，直接忘掉
-                if service.status == .enabled || service.status == .requiresApproval { try service.unregister() }
-                defaults.set(false, forKey: addedLoginItemKey)
-            }
-        } catch {
-            NSLog("%@", "Sleepwalk: login item \(want ? "register" : "unregister") failed: \(error.localizedDescription)")
-        }
+        set { UserDefaults.standard.set(newValue, forKey: leftOnKey) }
     }
 
     // 本 app 打开成功就记下（清除在 refresh 里）
@@ -474,9 +444,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.messageText = L("梦游只适用于 MacBook", "Sleepwalk is for MacBooks only")
             alert.informativeText = L("这台 Mac 没有可以合上的盖子。", "This Mac has no lid to close.")
             alert.runModal()
-            // 偏好设置迁移到没有盖子的 Mac 时，别留着登录项每次登录都弹这个框
-            LidModel.leftOn = false
-            LidModel.syncLoginItem(false)  // 标记原本就是 false 时 setter 不会触发，这里补一次对账
             keepAwakeOnQuit = true
             NSApp.terminate(nil)
             return
@@ -519,8 +486,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.hidePanel()
         }
         model.refresh()
-        // 对账：上次撤销登录项失败、或标记已清但登录项还在，这里补撤。只撤不加，用户手动删掉的不再加回
-        if !LidModel.leftOn { LidModel.syncLoginItem(false) }
         checkLeftOn()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.model.refresh()
