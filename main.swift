@@ -27,6 +27,20 @@ final class LidModel: ObservableObject {
     // 每个用户一份规则，互不覆盖
     static let ruleFile = "/etc/sudoers.d/sleepwalk-\(getuid())"
 
+    // 记住“合上继续跑”是本 app 打开的。正常退出会恢复并清掉；强制退出、崩溃、
+    // 无免密规则时注销关机会留下它，下次启动据此提醒（见 AppDelegate.checkLeftOn）。
+    // 标记按用户存，只提醒打开它的那个用户；app 不是登录项，要再打开一次才会提醒
+    static let leftOnKey = "SleepwalkTurnedOn"
+    static var leftOn: Bool {
+        get { UserDefaults.standard.bool(forKey: leftOnKey) }
+        set { UserDefaults.standard.set(newValue, forKey: leftOnKey) }
+    }
+
+    // 本 app 打开成功就记下（清除在 refresh 里）
+    private func noteResult(_ on: Bool) {
+        if on && isOn { Self.leftOn = true }
+    }
+
     func refresh() {
         let general = Self.output("/usr/bin/pmset", ["-g"])
         update(\.isOn, general.split(separator: "\n").contains {
@@ -47,6 +61,8 @@ final class LidModel: ObservableObject {
         }
         update(\.remaining, text)
         update(\.passwordless, FileManager.default.fileExists(atPath: Self.ruleFile))
+        // 只要看到已恢复正常睡眠（不论谁恢复的）就清掉标记
+        if !isOn && Self.leftOn { Self.leftOn = false }
     }
 
     // 只在值变了时才写，免得每 5 秒无故重绘
@@ -62,11 +78,20 @@ final class LidModel: ObservableObject {
     // 有免密规则就直接切换；没有就弹系统密码框。密码框在后台进程里，不卡界面
     func set(_ on: Bool, done: (() -> Void)? = nil) {
         guard !busy else { return }
+        // 先读真实状态：已经是目标值就不弹密码框，免得取消密码框时把别人开的误记成本 app 开的
+        refresh()
+        if isOn == on {
+            done?()
+            return
+        }
         if setWithoutPrompt(on) {
             done?()
             return
         }
-        runPrivileged("/usr/bin/pmset -a disablesleep \(on ? 1 : 0)", done: done)
+        runPrivileged("/usr/bin/pmset -a disablesleep \(on ? 1 : 0)") { [weak self] in
+            self?.noteResult(on)
+            done?()
+        }
     }
 
     // 只走免密规则，不弹任何框（注销、关机途中用）；返回是否成功
@@ -74,6 +99,7 @@ final class LidModel: ObservableObject {
     func setWithoutPrompt(_ on: Bool) -> Bool {
         let ok = Self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"]) == 0
         refresh()
+        if ok { noteResult(on) }
         return ok
     }
 
@@ -443,14 +469,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.hidePanel()
         }
         model.refresh()
+        checkLeftOn()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.model.refresh()
         }
         showPanel()
     }
 
-    // 退出默认恢复正常睡眠，免得忘了它还开着。所有退出途径（菜单、活动监视器、注销）都经过这里。
-    // 有免密规则就直接恢复；没有就弹密码框。注销、关机途中不能弹框，只能试免密。
+    // 退出默认恢复正常睡眠，免得忘了它还开着。正常退出（菜单、⌘Q、活动监视器的“退出”、注销关机）经过这里；
+    // 强制退出和崩溃不经过这里，由下次启动时的 checkLeftOn 兜底。
+    // 有免密规则就直接恢复；没有就弹密码框。注销、关机途中不能弹框，只能试免密，失败也由 checkLeftOn 兜底。
     // 恢复失败（比如取消了密码框）就说明后果，让用户决定还退不退
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if keepAwakeOnQuit { return .terminateNow }
@@ -463,7 +491,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         model.set(false) { [weak self] in
             guard let self else { return }
-            NSApp.reply(toApplicationShouldTerminate: !self.model.isOn || self.confirmQuitWhileOn())
+            let quit = !self.model.isOn || self.confirmQuitWhileOn()
+            // 看过提示仍然退出，算有意保留，下次启动不再提醒
+            if quit && self.model.isOn { LidModel.leftOn = false }
+            NSApp.reply(toApplicationShouldTerminate: quit)
         }
         return .terminateLater
     }
@@ -493,6 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func quitKeepingAwake() {
         keepAwakeOnQuit = true
+        LidModel.leftOn = false
         NSApp.terminate(nil)
     }
 
@@ -502,6 +534,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             string: L("Haoli 设计与制作\nMIT 许可证", "Designed and made by Haoli\nMIT License"),
             attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         NSApp.orderFrontStandardAboutPanel(options: [.applicationName: appName, .credits: credits])
+    }
+
+    // 上次是本 app 打开的“合上继续跑”，却没正常恢复就退出了（强制退出、崩溃、注销关机）：问用户怎么办。
+    // 这里不弹密码框，只有用户选“恢复睡眠”才走 set(false)（有免密规则就不用输密码）
+    private func checkLeftOn() {
+        guard model.isOn else { LidModel.leftOn = false; return }
+        guard LidModel.leftOn else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = L("上次没有正常退出", "Sleepwalk didn't quit normally last time")
+        alert.informativeText = L("合上继续跑还开着，合盖后 Mac 不会睡眠。要恢复正常睡眠吗？",
+                                  "Awake when closed is still on, so your Mac won't sleep when closed. Restore normal sleep?")
+        alert.addButton(withTitle: L("恢复睡眠", "Restore Sleep"))
+        alert.addButton(withTitle: L("保持开启", "Keep It On"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            model.set(false)
+        } else {
+            LidModel.leftOn = false
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
