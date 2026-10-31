@@ -39,6 +39,7 @@ Sleepwalk uses `pmset -a disablesleep 1`, an undocumented `pmset` option that st
 - **You can see it is on.** The menu-bar icon glows amber while it is on.
 - **Battery reminder.** While it is on and you are on battery, the footer shows *Drains battery*.
 - **Quit restores sleep.** Quit from the menu (right-click or Control-click the icon) and normal sleep comes back. If that fails, for example because you cancel the password prompt, Sleepwalk tells you and lets you stay open. To quit and keep it on, hold ⌥ in the menu: **Quit and Stay Awake**.
+- **Reminds you after an unclean exit.** If Sleepwalk is force-quit, crashes, or you log out or shut down without Switch Without Password while it is on, the setting stays on. Sleepwalk remembers it turned it on and, the next time you open it, asks whether to restore normal sleep.
 - **Optional: Switch Without Password.** Off by default, so each switch asks for your admin password. Turn it on to install a sudoers rule, for your user only, that allows exactly `pmset -a disablesleep 0` and `pmset -a disablesleep 1`. Turn it off to remove the rule.
 - **Small and local.** One Swift file. No network access, no analytics, no privileged helper or daemon.
 - **English and Chinese**, following your system language.
