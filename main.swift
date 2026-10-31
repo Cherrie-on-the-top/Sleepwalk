@@ -5,6 +5,7 @@ import AppKit
 import SwiftUI
 import Combine
 import IOKit
+import ServiceManagement
 
 // 系统首选语言是中文就用中文，其余一律英文
 let isChinese = Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
@@ -23,17 +24,50 @@ final class LidModel: ObservableObject {
     @Published var busy = false
     // 面板收起后暖光不再呼吸，省电
     @Published var panelVisible = false
+    // 打开中（已预写标记、还没出结果）：这期间 refresh 不清标记
+    private var pendingOn = false
+    // 至少成功读过一次 pmset；没读到就不据此清标记、不切换
+    private(set) var stateKnown = false
 
     // 每个用户一份规则，互不覆盖
     static let ruleFile = "/etc/sudoers.d/sleepwalk-\(getuid())"
 
     // 记住“合上继续跑”是本 app 打开的。正常退出会恢复并清掉；强制退出、崩溃、
     // 无免密规则时注销关机会留下它，下次启动据此提醒（见 AppDelegate.checkLeftOn）。
-    // 标记按用户存，只提醒打开它的那个用户；app 不是登录项，要再打开一次才会提醒
+    // 标记按用户存（disablesleep 却是全机的），只提醒打开它的那个用户；别的用户登录不会被提醒。
+    // 标记在的期间把 app 注册为登录项，这样注销、重启后登录就会自检；标记清掉就撤销登录项
     static let leftOnKey = "SleepwalkTurnedOn"
     static var leftOn: Bool {
         get { UserDefaults.standard.bool(forKey: leftOnKey) }
-        set { UserDefaults.standard.set(newValue, forKey: leftOnKey) }
+        set {
+            guard newValue != leftOn else { return }
+            UserDefaults.standard.set(newValue, forKey: leftOnKey)
+            syncLoginItem(newValue)
+        }
+    }
+
+    // 只撤销本 app 自己加的登录项；用户原本就设了开机启动的，不动。失败只记日志
+    static let addedLoginItemKey = "SleepwalkAddedLoginItem"
+    static func syncLoginItem(_ want: Bool) {
+        let service = SMAppService.mainApp
+        let defaults = UserDefaults.standard
+        do {
+            if want {
+                // 已注册（包括用户自己关掉、待批准的）就不碰，尊重用户的选择
+                guard service.status == .notRegistered else { return }
+                // 有免密规则时注销关机能自己恢复，不需要登录项（强制退出/崩溃靠下次手动打开时提醒）
+                guard !FileManager.default.fileExists(atPath: ruleFile) else { return }
+                try service.register()
+                defaults.set(true, forKey: addedLoginItemKey)
+            } else if defaults.bool(forKey: addedLoginItemKey) {
+                // 待批准的也要撤，免得以后被批准变成每次登录都启动；撤成功才忘掉“是我加的”，失败下次启动再试
+                // 找不到（app 被移动、改名）时 unregister 会一直失败，直接忘掉
+                if service.status == .enabled || service.status == .requiresApproval { try service.unregister() }
+                defaults.set(false, forKey: addedLoginItemKey)
+            }
+        } catch {
+            NSLog("%@", "Sleepwalk: login item \(want ? "register" : "unregister") failed: \(error.localizedDescription)")
+        }
     }
 
     // 本 app 打开成功就记下（清除在 refresh 里）
@@ -43,6 +77,9 @@ final class LidModel: ObservableObject {
 
     func refresh() {
         let general = Self.output("/usr/bin/pmset", ["-g"])
+        // 读失败（空输出）时别把状态当成关，免得误清标记
+        guard !general.isEmpty else { return }
+        stateKnown = true
         update(\.isOn, general.split(separator: "\n").contains {
             $0.contains("SleepDisabled") && $0.trimmingCharacters(in: .whitespaces).hasSuffix("1")
         })
@@ -61,8 +98,8 @@ final class LidModel: ObservableObject {
         }
         update(\.remaining, text)
         update(\.passwordless, FileManager.default.fileExists(atPath: Self.ruleFile))
-        // 只要看到已恢复正常睡眠（不论谁恢复的）就清掉标记
-        if !isOn && Self.leftOn { Self.leftOn = false }
+        // 只要看到已恢复正常睡眠（不论谁恢复的）就清掉标记；正在等密码时不清，那时标记是预先写的
+        if !isOn && !busy && !pendingOn && Self.leftOn { Self.leftOn = false }
     }
 
     // 只在值变了时才写，免得每 5 秒无故重绘
@@ -80,11 +117,19 @@ final class LidModel: ObservableObject {
         guard !busy else { return }
         // 先读真实状态：已经是目标值就不弹密码框，免得取消密码框时把别人开的误记成本 app 开的
         refresh()
+        guard stateKnown else { done?(); return }
         if isOn == on {
             done?()
             return
         }
+        // 打开前先记下：密码框开着时被强制退出、或 pmset 成功后崩溃，也不会漏记。
+        // 上面已确认现在是关的，所以不会把别人开的记成本 app 开的；没开成的话 refresh 会清掉
+        if on {
+            Self.leftOn = true
+            pendingOn = true
+        }
         if setWithoutPrompt(on) {
+            pendingOn = false
             done?()
             return
         }
@@ -135,6 +180,7 @@ final class LidModel: ObservableObject {
             let failure = Self.runAsAdmin(command)
             DispatchQueue.main.async {
                 self.busy = false
+                self.pendingOn = false
                 self.refresh()
                 if let failure { Self.showError(failure) }
                 done?()
@@ -413,7 +459,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static let amberNS = NSColor(calibratedRed: 1.0, green: 0.71, blue: 0.32, alpha: 1)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 已经有一个在跑（比如从别处又打开了一份）：这一份直接退出，不碰睡眠设置
+        // 已经有一个在跑（比如从别处又打开了一份）：这一份直接退出，不碰睡眠设置。
+        // 靠 bundle id 判断，只对打包成 .app 的版本有效（install.sh 就是这么装的）；直接跑裸可执行文件时查不到
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
             .filter { $0 != NSRunningApplication.current }
         if !others.isEmpty {
@@ -427,6 +474,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.messageText = L("梦游只适用于 MacBook", "Sleepwalk is for MacBooks only")
             alert.informativeText = L("这台 Mac 没有可以合上的盖子。", "This Mac has no lid to close.")
             alert.runModal()
+            // 偏好设置迁移到没有盖子的 Mac 时，别留着登录项每次登录都弹这个框
+            LidModel.leftOn = false
+            LidModel.syncLoginItem(false)  // 标记原本就是 false 时 setter 不会触发，这里补一次对账
             keepAwakeOnQuit = true
             NSApp.terminate(nil)
             return
@@ -469,6 +519,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.hidePanel()
         }
         model.refresh()
+        // 对账：上次撤销登录项失败、或标记已清但登录项还在，这里补撤。只撤不加，用户手动删掉的不再加回
+        if !LidModel.leftOn { LidModel.syncLoginItem(false) }
         checkLeftOn()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.model.refresh()
@@ -482,6 +534,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // 恢复失败（比如取消了密码框）就说明后果，让用户决定还退不退
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if keepAwakeOnQuit { return .terminateNow }
+        // 正在等密码框时不退（注销关机除外），理由同 quitKeepingAwake
+        if model.busy && !isSessionEnding {
+            NSSound.beep()
+            return .terminateCancel
+        }
         model.refresh()
         guard model.isOn else { return .terminateNow }
         if model.setWithoutPrompt(false) || isSessionEnding { return .terminateNow }
@@ -523,6 +580,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func quitKeepingAwake() {
+        // 正在等密码框：退了之后密码框可能还在，输对就会留下没有标记的开启状态
+        guard !model.busy else { NSSound.beep(); return }
         keepAwakeOnQuit = true
         LidModel.leftOn = false
         NSApp.terminate(nil)
@@ -539,6 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // 上次是本 app 打开的“合上继续跑”，却没正常恢复就退出了（强制退出、崩溃、注销关机）：问用户怎么办。
     // 这里不弹密码框，只有用户选“恢复睡眠”才走 set(false)（有免密规则就不用输密码）
     private func checkLeftOn() {
+        guard model.stateKnown else { return }
         guard model.isOn else { LidModel.leftOn = false; return }
         guard LidModel.leftOn else { return }
         NSApp.activate(ignoringOtherApps: true)
@@ -548,10 +608,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   "Awake when closed is still on, so your Mac won't sleep when closed. Restore normal sleep?")
         alert.addButton(withTitle: L("恢复睡眠", "Restore Sleep"))
         alert.addButton(withTitle: L("保持开启", "Keep It On"))
+        // 选“保持开启”不清标记：之后再异常退出仍会提醒；正常退出时照常恢复或清掉
         if alert.runModal() == .alertFirstButtonReturn {
             model.set(false)
-        } else {
-            LidModel.leftOn = false
         }
     }
 
